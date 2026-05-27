@@ -23,6 +23,7 @@ from docx_revisions._helpers import (
     next_revision_id,
     revision_attrs,
     splice_tracked_replace,
+    wrap_with_comment,
 )
 from docx_revisions.revision import TrackedChange, TrackedDeletion, TrackedInsertion
 
@@ -188,6 +189,7 @@ class RevisionParagraph(Paragraph):
         style: str | CharacterStyle | None = None,
         author: str = "",
         revision_id: int | None = None,
+        comment: str | None = None,
     ) -> TrackedInsertion:
         """Append a tracked insertion containing a run with the specified text.
 
@@ -200,6 +202,9 @@ class RevisionParagraph(Paragraph):
             author: Author name for the revision.  Defaults to empty string.
             revision_id: Unique ID for this revision.  Auto-generated if not
                 provided.
+            comment: Optional comment text to attach to the insertion.  When
+                provided, a Word comment is created and anchored to the new
+                ``w:ins`` element.
 
         Returns:
             A ``TrackedInsertion`` wrapping the new ``w:ins`` element.
@@ -231,10 +236,128 @@ class RevisionParagraph(Paragraph):
             for run in tracked_insertion.runs:
                 run.style = style
 
+        if comment:
+            self._attach_comment(ins, ins, comment, author)
+
+        return tracked_insertion
+
+    def add_tracked_insertion_at(
+        self,
+        index: int,
+        text: str | None = None,
+        style: str | CharacterStyle | None = None,
+        author: str = "",
+        revision_id: int | None = None,
+        index_mode: IndexMode = "text",
+        comment: str | None = None,
+    ) -> TrackedInsertion:
+        """Insert a tracked insertion at character offset *index*.
+
+        Like :meth:`add_tracked_insertion`, but places the new ``w:ins`` at a
+        specific character position rather than appending to the end of the
+        paragraph.  If *index* falls inside an existing run, the run is split
+        so the insertion lands cleanly between two text runs.
+
+        Args:
+            index: Character offset (0-based) at which to insert.  ``0`` puts
+                the insertion before all existing content; ``len(view_text)``
+                appends to the end.
+            text: Text to add to the run.
+            style: Character style to apply to the run.
+            author: Author name for the revision.  Defaults to empty string.
+            revision_id: Unique ID for this revision.  Auto-generated if not
+                provided.
+            index_mode: Which text view *index* indexes into:
+                ``"text"`` (default, raw ``paragraph.text``), ``"accepted"``
+                (``paragraph.accepted_text``), or ``"original"``
+                (``paragraph.original_text``).
+            comment: Optional comment text to attach to the insertion.  When
+                provided, a Word comment is created and anchored to the new
+                ``w:ins`` element.
+
+        Returns:
+            A ``TrackedInsertion`` wrapping the new ``w:ins`` element.
+
+        Raises:
+            ValueError: If *index* is out of bounds.
+
+        Example:
+            ```python
+            rp = RevisionParagraph.from_paragraph(paragraph)
+            # Insert "Hi " at the very start of the paragraph
+            rp.add_tracked_insertion_at(0, text="Hi ", author="Editor")
+            ```
+        """
+        view_text = self._view_text(index_mode)
+        if index < 0 or index > len(view_text):
+            raise ValueError(f"Invalid offset: index={index} for text of length {len(view_text)}")
+
+        if revision_id is None:
+            revision_id = self._next_revision_id()
+
+        ins = OxmlElement(
+            "w:ins",
+            attrs=revision_attrs(revision_id, author, dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        r = OxmlElement("w:r")
+        ins.append(r)
+
+        units = self._get_editable_units(index_mode)
+        if not units:
+            self._p.append(ins)  # pyright: ignore[reportUnknownMemberType]
+        else:
+            boundaries = self._unit_boundaries(units)
+            unit_idx, offset_in_unit = self._find_unit_at_offset(boundaries, index)
+            target_unit = units[unit_idx]
+            parent = target_unit.getparent()
+            if parent is None:
+                raise ValueError("Cannot determine insertion location")
+
+            def _r_text(run: etree._Element) -> str:
+                parts: List[str] = []
+                for child in run.xpath("./w:t | ./w:delText"):
+                    parts.append(child.text or "")
+                return "".join(parts)
+
+            unit_text = _r_text(target_unit)
+            target_idx_in_parent = list(parent).index(target_unit)
+
+            if offset_in_unit <= 0:
+                parent.insert(target_idx_in_parent, ins)
+            elif offset_in_unit >= len(unit_text):
+                parent.insert(target_idx_in_parent + 1, ins)
+            else:
+                before_text = unit_text[:offset_in_unit]
+                after_text = unit_text[offset_in_unit:]
+                parent.remove(target_unit)
+                insert_pos = target_idx_in_parent
+                parent.insert(insert_pos, make_text_run(before_text))
+                insert_pos += 1
+                parent.insert(insert_pos, ins)
+                insert_pos += 1
+                parent.insert(insert_pos, make_text_run(after_text))
+
+        tracked_insertion = TrackedInsertion(ins, self)  # pyright: ignore[reportArgumentType]
+        if text:
+            for run in tracked_insertion.runs:
+                run.text = text
+        if style:
+            for run in tracked_insertion.runs:
+                run.style = style
+
+        if comment:
+            self._attach_comment(ins, ins, comment, author)
+
         return tracked_insertion
 
     def add_tracked_deletion(
-        self, start: int, end: int, author: str = "", revision_id: int | None = None, index_mode: IndexMode = "text"
+        self,
+        start: int,
+        end: int,
+        author: str = "",
+        revision_id: int | None = None,
+        index_mode: IndexMode = "text",
+        comment: str | None = None,
     ) -> TrackedDeletion:
         """Wrap existing text at *[start, end)* in a ``w:del`` element.
 
@@ -253,6 +376,9 @@ class RevisionParagraph(Paragraph):
                 prior insertions kept and deletions skipped), or
                 ``"original"`` (``paragraph.original_text``, with prior
                 deletions kept and insertions skipped).
+            comment: Optional comment text to attach to the deletion.  When
+                provided, a Word comment is created and anchored to the new
+                ``w:del`` element.
 
         Returns:
             A ``TrackedDeletion`` wrapping the new ``w:del`` element.
@@ -334,6 +460,9 @@ class RevisionParagraph(Paragraph):
 
         if after_text:
             parent.insert(insert_idx, make_text_run(after_text))
+
+        if comment:
+            self._attach_comment(del_elem, del_elem, comment, author)
 
         return TrackedDeletion(del_elem, self)  # pyright: ignore[reportArgumentType]
 
@@ -495,9 +624,12 @@ class RevisionParagraph(Paragraph):
             if run_elem.getparent() is parent:
                 parent.remove(run_elem)
 
-        splice_tracked_replace(
+        del_elem, ins_elem = splice_tracked_replace(
             parent, index, before_text, deleted_text, replace_text, after_text, author, self._next_revision_id, now
         )
+
+        if comment:
+            self._attach_comment(del_elem, ins_elem, comment, author)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -506,6 +638,17 @@ class RevisionParagraph(Paragraph):
     def _next_revision_id(self) -> int:
         """Generate the next unique revision ID for this document."""
         return next_revision_id(self._p)
+
+    def _attach_comment(
+        self,
+        first_elem: etree._Element,
+        last_elem: etree._Element,
+        comment: str,
+        author: str,
+    ) -> None:
+        """Create a Word comment and wrap *first_elem* … *last_elem* with range markers."""
+        comment_obj = self.part.comments.add_comment(text=comment, author=author)
+        wrap_with_comment(first_elem, last_elem, comment_obj.comment_id)
 
     def _view_text(self, index_mode: IndexMode) -> str:
         """Return the paragraph text for the chosen index mode."""

@@ -53,6 +53,51 @@ def make_ins_element(insert_text: str, author: str, rev_id: int, now: str) -> Ox
     return ins_elem
 
 
+def make_comment_range_start(comment_id: int) -> OxmlElement:
+    """Create a ``<w:commentRangeStart w:id="N"/>`` marker element."""
+    return OxmlElement("w:commentRangeStart", attrs={qn("w:id"): str(comment_id)})
+
+
+def make_comment_range_end(comment_id: int) -> OxmlElement:
+    """Create a ``<w:commentRangeEnd w:id="N"/>`` marker element."""
+    return OxmlElement("w:commentRangeEnd", attrs={qn("w:id"): str(comment_id)})
+
+
+def make_comment_reference_run(comment_id: int) -> OxmlElement:
+    """Create a ``<w:r>`` wrapping a ``<w:commentReference w:id="N"/>`` element.
+
+    This is the "anchor" run Word reads when navigating to the commented range.
+    """
+    r = OxmlElement("w:r")
+    rPr = OxmlElement("w:rPr")
+    rStyle = OxmlElement("w:rStyle")
+    rStyle.set(qn("w:val"), "CommentReference")
+    rPr.append(rStyle)
+    r.append(rPr)
+    r.append(OxmlElement("w:commentReference", attrs={qn("w:id"): str(comment_id)}))
+    return r
+
+
+def wrap_with_comment(first_elem: etree._Element, last_elem: etree._Element, comment_id: int) -> None:
+    """Wrap the sibling range *first_elem* … *last_elem* with comment range markers.
+
+    Inserts ``w:commentRangeStart`` immediately before *first_elem* and
+    ``w:commentRangeEnd`` followed by a ``w:r/w:commentReference`` immediately
+    after *last_elem*.  Both elements must share the same parent.
+    """
+    parent = first_elem.getparent()
+    if parent is None or last_elem.getparent() is not parent:
+        raise ValueError("first_elem and last_elem must share the same parent")
+
+    first_idx = list(parent).index(first_elem)
+    parent.insert(first_idx, make_comment_range_start(comment_id))
+
+    # last_elem's position shifted by 1 because of the insertion before first_elem
+    last_idx = list(parent).index(last_elem)
+    parent.insert(last_idx + 1, make_comment_range_end(comment_id))
+    parent.insert(last_idx + 2, make_comment_reference_run(comment_id))
+
+
 def splice_tracked_replace(
     parent: etree._Element,
     index: int,
@@ -63,28 +108,30 @@ def splice_tracked_replace(
     author: str,
     next_id_fn: Callable[[], int],
     now: str,
-) -> int:
+) -> tuple[etree._Element, etree._Element]:
     """Insert the before-run / w:del / w:ins / after-run sequence into *parent* at *index*.
 
     Returns:
-        The number of elements inserted.
+        The ``(w:del, w:ins)`` element pair that was inserted, so the caller
+        can attach further metadata (e.g. comment range markers) around them.
     """
     insert_idx = index
     if before_text:
         parent.insert(insert_idx, make_text_run(before_text))
         insert_idx += 1
 
-    parent.insert(insert_idx, make_del_element(deleted_text, author, next_id_fn(), now))
+    del_elem = make_del_element(deleted_text, author, next_id_fn(), now)
+    parent.insert(insert_idx, del_elem)
     insert_idx += 1
 
-    parent.insert(insert_idx, make_ins_element(insert_text, author, next_id_fn(), now))
+    ins_elem = make_ins_element(insert_text, author, next_id_fn(), now)
+    parent.insert(insert_idx, ins_elem)
     insert_idx += 1
 
     if after_text:
         parent.insert(insert_idx, make_text_run(after_text))
-        insert_idx += 1
 
-    return insert_idx - index
+    return del_elem, ins_elem
 
 
 def next_revision_id(element: etree._Element) -> int:
